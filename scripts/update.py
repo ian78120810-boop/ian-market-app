@@ -2,6 +2,7 @@
 import argparse,csv,io,json,math,re,sys,time,urllib.request,urllib.parse
 from datetime import datetime,date,timedelta,timezone
 from pathlib import Path
+import rankings, concepts
 ROOT=Path(__file__).resolve().parents[1]; DATA=ROOT/'site'/'data'; START='2026-01-01'; TZ=timezone(timedelta(hours=8)); BASE='https://www.twse.com.tw/rwd/zh/'
 FIELDS=['date','open','high','low','close','turnover_100m','volume','margin_pct','balance','source']
 def num(x):
@@ -20,11 +21,12 @@ def fetch(path,d,**args):
   req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 TaiwanMarketDashboard','Accept':'application/json'})
   with urllib.request.urlopen(req,timeout=35) as r: obj=json.load(r)
   if not isinstance(obj,dict):raise ValueError('回傳非 JSON 物件')
+  if path.endswith('STOCK_DAY') and ('沒有符合' in str(obj.get('stat','')) or '查無資料' in str(obj.get('stat',''))):return obj
   returned=str(obj.get('date','')).replace('-','')
   if len(returned)==8 and returned.isdigit():
-   target=d.replace('-',''); monthly=path.endswith(('HIST','FMTQIK'))
+   target=d.replace('-',''); monthly=path.endswith(('HIST','FMTQIK','STOCK_DAY'))
    if (returned[:6]!=target[:6] if monthly else returned!=target):raise ValueError('來源日期不符')
-  elif not path.endswith(('HIST','FMTQIK')):
+  elif not path.endswith(('HIST','FMTQIK','STOCK_DAY')):
    # Date-specific endpoint must identify the requested date in date/title fields.
    titles=' '.join(str(t.get('title','')) for t in [obj]+obj.get('tables',[]))
    day=date.fromisoformat(d); roc=day.year-1911
@@ -54,9 +56,44 @@ def market_month(m,end):
  expected={d for d in vol if START<=d<=end}
  if {r['date'] for r in out}!=expected:raise ValueError('日 K 和成交資料日期不一致')
  return out
-def quote_map(day):
- f,rows=table(fetch('afterTrading/MI_INDEX',day,type='ALLBUT0999'),'證券代號','收盤價')
- return {str(r[ix(f,'證券代號')]).strip():v for r in rows if (v:=num(r[ix(f,'收盤價')])) is not None and v>0}
+def quote_map(day,obj=None):
+ if obj is None:obj=fetch('afterTrading/MI_INDEX',day,type='ALLBUT0999')
+ result={}
+ for t in [obj]+obj.get('tables',[]):
+  f=[re.sub(r'\s+','',str(x)) for x in t.get('fields',[])]
+  if not all(any(k in v for v in f) for k in ('證券代號','收盤價')):continue
+  ci,pi=ix(f,'證券代號'),ix(f,'收盤價')
+  for r in t.get('data',[]):
+   v=num(r[pi]);k=str(r[ci]).strip()
+   if v is not None and v>0:result[k]=v
+ if not result:raise ValueError('沒有每日收盤行情')
+ return result
+
+def stock_month(code,month,cache):
+ """Monthly official individual quotes; never accept future prices for a past day."""
+ key=(code,month)
+ if key not in cache:
+  obj=fetch('afterTrading/STOCK_DAY',month,stockNo=code)
+  if '沒有符合' in str(obj.get('stat','')) or '查無資料' in str(obj.get('stat','')):
+   cache[key]=[]
+  else:
+   f,rs=table(obj,'日期','收盤價'); rows=[]
+   for r in rs:
+    d=iso(r[ix(f,'日期')]);v=num(r[ix(f,'收盤價')])
+    if d[:7]!=month[:7]:raise ValueError('個股行情月份不符')
+    if v is not None and v>0:rows.append((d,v))
+   cache[key]=sorted(rows)
+ return cache[key]
+
+def resolve_price(code,day,cache,months_back=12):
+ m=date.fromisoformat(day).replace(day=1)
+ for _ in range(months_back+1):
+  rows=stock_month(code,m.isoformat(),cache)
+  valid=[(d,v) for d,v in rows if d<=day]
+  if valid:return valid[-1]
+  m=(m-timedelta(days=1)).replace(day=1)
+ return None
+
 def margin_input(obj):
  f,rs=table(obj,'代號','今日餘額');si=ix(f,'今日餘額');ci=ix(f,'代號');shares={str(r[ci]).strip():v for r in rs if (v:=num(r[si])) is not None and v>0}
  g,rr=table(obj,'項目','今日餘額');amount=next((num(r[ix(g,'今日餘額')]) for r in rr if '融資金額' in str(r[ix(g,'項目')])),None)
@@ -65,7 +102,7 @@ def margin_input(obj):
  return shares,amount
 def estimate(shares,amount,quotes):
  missing=set(shares)-set(quotes)
- if missing:raise ValueError(f'{len(missing)} 檔缺少收盤價；不估算')
+ if missing:raise ValueError(f'{len(missing)} 檔缺少收盤價；不估算；代號：'+', '.join(sorted(missing)))
  ratio=sum(shares[k]*quotes[k] for k in shares)/amount*100
  if not 50<ratio<500:raise ValueError('估算超出合理檢查範圍')
  return round(ratio,2)
@@ -84,24 +121,88 @@ def run(full=False):
    print(m,'price',len(rows),flush=True)
   except Exception as e:errors.append(m+': '+str(e));print(errors[-1],flush=True)
  # Always retry the latest three sessions; backfill gradually on subsequent runs.
- dates=sorted(daily,reverse=True); recent=dates[:3];missing=[d for d in dates if d not in recent and daily[d].get('margin_pct') is None];queue=recent+missing[:(240 if full else 8)]
- cache={}
+ dates=sorted(daily,reverse=True); recent=dates[:3];missing=[d for d in dates if d not in recent and daily[d].get('margin_pct') is None]
+ ranks=state.setdefault('rankings',{});rank_missing=[d for d in dates if d not in recent and not all(k in ranks.get(d,{}) for k in ('sectors','credit'))]
+ # Full mode still shares the original history queue; otherwise prioritize recent sessions and bounded backfill.
+ queue=list(dict.fromkeys(recent+missing[:(50 if full else 8)]+rank_missing[:(50 if full else 8)]))
+ try:companies,classification_date=rankings.company_map()
+ except Exception as e:companies={};classification_date='';errors.append('排行榜產業分類：'+str(e))
+ # New concept history is backfilled gradually (recent 6 sessions first).
+ concept_missing=[d for d in dates[6:] if not all(k in ranks.get(d,{}).get('concepts',{}) for k in ('listed','otc')) or 'credit_otc' not in ranks.get(d,{})]
+ concept_missing.sort(key=lambda d:ranks.get(d,{}).get('concept_attempt',''))
+ concept_dates=set(dates[:6]+concept_missing[: (25 if full else 5)])
+ queue=list(dict.fromkeys(recent+dates[:6]+[d for d in dates if d in concept_dates]+queue))
+ try:otc=concepts.otc_companies()
+ except Exception as e:otc={};errors.append('上櫃公司分類：'+str(e))
+ cache={}; stock_cache={}
  for i,d in enumerate(queue):
+  if (datetime.now(TZ)-t).total_seconds()>68*60:
+   errors.append('本次更新達時間預算；剩餘日期由後續排程補抓');break
   try:
-   shares,amount=margin_input(fetch('marginTrading/MI_MARGN',d,selectType='ALL'))
+   raw_margin=None;raw_quotes=None
+   try:raw_margin=fetch('marginTrading/MI_MARGN',d,selectType='ALL')
+   except Exception as e:errors.append(d+' 資券明細：'+str(e))
+   try:raw_quotes=fetch('afterTrading/MI_INDEX',d,type='ALLBUT0999')
+   except Exception as e:errors.append(d+' 個股行情：'+str(e))
+   if companies:
+    rec=ranks.setdefault(d,{});rec['classification_date']=classification_date;re=[];qr={}
+    if raw_quotes is not None:
+     try:qr=rankings.quotes(raw_quotes);rec['sectors']=rankings.sector_rank(qr,companies)
+     except Exception as e:re.append('產業：'+str(e))
+    else:re.append('產業：個股行情未取得')
+    if raw_margin is not None:
+     try:rec['credit']=rankings.credit_rank(raw_margin,qr,companies)
+     except Exception as e:re.append('資券：'+str(e))
+    else:re.append('資券：明細未取得')
+    rec['errors']=re
+    if re:errors.extend(d+' 排行榜：'+x for x in re)
+    print(d,'rankings', 'sectors' in rec,'credit' in rec,flush=True)
+   if d in concept_dates:
+    rec=ranks.setdefault(d,{});con=rec.setdefault('concepts',{});ce=[]
+    if companies and raw_quotes is not None:
+     try:con['listed']=concepts.summarize(rankings.quotes(raw_quotes),companies,'上市')
+     except Exception as e:ce.append('上市族群：'+str(e))
+    if otc:
+     oq={}
+     try:
+      oq=concepts.otc_quotes(concepts.otc_fetch('afterTrading/dailyQuotes',d),otc)
+      con['otc']=concepts.summarize(oq,otc,'上櫃')
+     except Exception as e:ce.append('上櫃行情：'+str(e))
+     try:rec['credit_otc']=concepts.otc_credit(concepts.otc_fetch('margin/balance',d),oq,otc)
+     except Exception as e:ce.append('上櫃資券：'+str(e))
+    else:ce.append('上櫃名單未取得')
+    rec['concept_errors']=ce;rec['concept_attempt']=t.isoformat();errors.extend(d+' '+x for x in ce)
+    print(d,'concepts',list(con), 'OTC credit','credit_otc' in rec,flush=True)
+   if raw_margin is None:raise ValueError('融資資料未取得')
+   shares,amount=margin_input(raw_margin)
    daily[d]['balance']=round(amount/100000,4)
-   quotes=cache.get(d) or quote_map(d);cache[d]=quotes
-   # A suspended or untraded issue may have no same-day close. Use earlier closes only, explicitly labeled.
-   merged=dict(quotes);used_prior=False
+   if raw_quotes is None:raise ValueError('個股行情未取得')
+   quotes=quote_map(d,raw_quotes);cache[d]=quotes
+   # First check recent official market closes, then individual monthly history.
+   merged=dict(quotes); prior={}; notes=[]
    if set(shares)-set(merged):
     for old in [x for x in dates if x<d][:5]:
      if old not in cache:
       try:cache[old]=quote_map(old)
       except Exception:continue
      for k in set(shares)-set(merged):
-      if k in cache[old]:merged[k]=cache[old][k];used_prior=True
+      if k in cache[old]:merged[k]=cache[old][k];prior[k]=old
      if not set(shares)-set(merged):break
-   daily[d].update(margin_pct=estimate(shares,amount,merged),source='TWSE 估算'+('（含前收）' if used_prior else ''))
+   for k in sorted(set(shares)-set(merged)):
+    try:
+     hit=resolve_price(k,d,stock_cache)
+     if hit:
+      pricedate,price=hit;merged[k]=price
+      if pricedate<d:prior[k]=pricedate
+     else:notes.append(k+' 查無最近一年歷史收盤價')
+    except Exception as e:notes.append(k+' 個股補查失敗：'+str(e))
+   unresolved=set(shares)-set(merged)
+   if unresolved:
+    count=sum(shares[k] for k in unresolved);coverage=(1-count/sum(shares.values()))*100
+    raise ValueError('缺少收盤價；不估算；代號：'+', '.join(sorted(unresolved))+f'；張數覆蓋率 {coverage:.4f}%'+('；'+'；'.join(notes) if notes else ''))
+   source='TWSE 估算'+(f'（含 {len(prior)} 檔前收）' if prior else '')
+   daily[d].update(margin_pct=estimate(shares,amount,merged),source=source)
+   if prior:print(d,'prior closes',', '.join(f'{k}={v}' for k,v in sorted(prior.items())),flush=True)
    print(d,'margin',daily[d]['margin_pct'],flush=True)
   except Exception as e:errors.append(d+': '+str(e));print(errors[-1],flush=True)
   # Persist partial progress even if later dates fail.
