@@ -1,0 +1,58 @@
+name: 台股每日更新與網站部署
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 14 * * 1-5' # 台灣時間週一至五 22:17
+    - cron: '43 17 * * 1-5' # 台灣時間週二至六 01:43
+  workflow_dispatch:
+    inputs:
+      full:
+        description: '補齊所有歷史融資維持率（需要多次查詢）'
+        type: boolean
+        default: false
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: taiwan-market-pages
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Update market data
+        if: github.event_name != 'push'
+        env:
+          FULL: ${{ inputs.full }}
+        run: |
+          if [ "$FULL" = "true" ]; then python scripts/update.py --full; else python scripts/update.py; fi
+      - name: Save history
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add site/data
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update market history'
+            git push
+          fi
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    needs: update
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
